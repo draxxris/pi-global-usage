@@ -1,0 +1,17 @@
+{
+  "name": "pi-global-usage",
+  "version": "0.1.0",
+  "description": "Global pi token/cost usage logger (extension) + pretty-table CLI with backfill",
+  "type": "module",
+  "bin": {
+    "pi-global-usage": "./bin/pi-global-usage.js"
+  },
+  "pi": {
+    "extensions": ["./extensions/usage-logger.ts"]
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "keywords": ["pi-package"],
+  "license": "MIT"
+}
