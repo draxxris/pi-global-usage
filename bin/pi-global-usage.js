@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 // pi-global-usage — pretty tables of global pi token/cost usage.
 //   pi-global-usage [--by model|session] [--days N] [--sort cost|total|calls|input]
-//                   [--limit N] [--json] [--backfill] [--db PATH]
+//                   [--limit N] [--json] [--backfill] [--ingest] [--db PATH]
 // Zero dependencies (node:sqlite only, Node >= 22.5).
 import { DatabaseSync } from "node:sqlite";
 import { existsSync } from "node:fs";
-import { backfill, dbPath, ingestLiveLog, liveLogPath, openDb, sessionsDir, truncateLiveLog } from "../src/db.js";
+import { backfill, dbPath, drainLiveLog, ingestLiveLog, liveLogPath, openDb, sessionsDir } from "../src/db.js";
 
 const args = process.argv.slice(2);
-const opt = { by: "model", days: 0, sort: "cost", limit: 0, json: false, backfill: false, db: null, help: false };
+const opt = { by: "model", days: 0, sort: "cost", limit: 0, json: false, backfill: false, ingest: false, db: null, help: false };
 for (let i = 0; i < args.length; i++) {
   const a = args[i];
   const next = () => args[++i];
@@ -19,6 +19,7 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--db") opt.db = next();
   else if (a === "--json") opt.json = true;
   else if (a === "--backfill") opt.backfill = true;
+  else if (a === "--ingest") opt.ingest = true;
   else if (a === "-h" || a === "--help" || a === "help") opt.help = true;
   else if (a.startsWith("--by=")) opt.by = a.slice(5).toLowerCase();
   else if (a.startsWith("--days=")) opt.days = parseInt(a.slice(7), 10) || 0;
@@ -32,7 +33,7 @@ if (opt.help) {
 
 Usage:
   pi-global-usage [--by model|session] [--days N] [--sort cost|total|calls|input]
-                  [--limit N] [--json] [--backfill] [--db PATH]
+                  [--limit N] [--json] [--backfill] [--ingest] [--db PATH]
 
 Options:
   --by model|session   Group rows by model (provider/model) or by session. Default: model
@@ -41,6 +42,7 @@ Options:
   --limit N            Show only top N groups. Default: all
   --json               Output raw JSON instead of a table
   --backfill           (Re)scan ~/.pi/agent/sessions/*.jsonl into usage.db first
+  --ingest             Merge usage.jsonl into usage.db and exit without rendering
   --db PATH            Override DB path (default: $PI_USAGE_DB or ~/.pi/agent/usage.db)
 
 Columns: Calls ┃ Input ┃ Output ┃ Cache R ┃ Cache W ┃ Total ┃ Cost
@@ -60,16 +62,23 @@ if (!["model", "session"].includes(opt.by)) {
 
 const path = opt.db || dbPath();
 
+if (opt.ingest) {
+  const db = openDb(path);
+  ingestLiveLog(db, liveLogPath());
+  db.close();
+  process.exit(0);
+}
+
 function syncDb() {
   // Every run: merge extension live-log + (first run) session backfill into sqlite.
   const db = openDb(path);
-  ingestLiveLog(db, liveLogPath());
-  truncateLiveLog(liveLogPath());
+  drainLiveLog(db, liveLogPath());
   const count = db.prepare("SELECT COUNT(*) AS c FROM usage_events").get().c;
-  if (count === 0) {
+  const historical = db.prepare("SELECT COUNT(*) AS c FROM usage_events WHERE source LIKE 'backfill%'").get().c;
+  if (count === 0 || historical === 0) {
     const res = backfill(db, sessionsDir());
     db.close();
-    if (res.rows === 0) {
+    if (res.rows === 0 && count === 0) {
       console.error(`no usage data yet (scanned ${res.files} session files).`);
       console.error(`The pi extension logs new responses to ${liveLogPath()} going forward.`);
       process.exit(0);
@@ -81,12 +90,11 @@ function syncDb() {
 
 if (opt.backfill) {
   const db = openDb(path);
-  const live = ingestLiveLog(db, liveLogPath());
+  const live = drainLiveLog(db, liveLogPath());
   const res = backfill(db, sessionsDir(), (done, total) =>
     process.stderr.write(`\rbackfill ${done}/${total} files...`),
   );
   if (live) process.stderr.write(`ingested ${live} live-log rows.\n`);
-  truncateLiveLog(liveLogPath());
   process.stderr.write(`\nbackfilled ${res.rows} usage rows from ${res.files} session files.\n`);
   db.close();
 } else {

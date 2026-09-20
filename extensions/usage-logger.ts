@@ -1,10 +1,9 @@
 // pi-global-usage extension — logs token/cost usage on every model response.
 //
-// Design note: pi's extension sandbox does NOT allow `node:sqlite`, so the
-// extension appends one JSON line per response to ~/.pi/agent/usage.jsonl
-// (atomic O_APPEND, safe for concurrent pi sessions). The standalone CLI
-// ingests that log into usage.db on each run and also backfills history
-// from sessions/*.jsonl.
+// Pi extensions cannot rely on node:sqlite, so the extension appends one JSON
+// line per response to ~/.pi/agent/usage.jsonl (atomic O_APPEND, safe for
+// concurrent pi sessions). A separate pi-global-usage --ingest process merges
+// that log into usage.db after startup and after new rows are written.
 //
 // Hooks:
 //   message_end (assistant) → main per-response usage
@@ -13,6 +12,7 @@
 import { appendFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 function configDir() {
   return process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
@@ -26,7 +26,52 @@ function num(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? Math.round(v) : fallback;
 }
 
-function logRow(ctx, { usage, provider, model, source, entryId }) {
+function timestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return Math.round(value);
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return Date.now();
+}
+
+function usageCliPath() {
+  const configured = process.env.PI_USAGE_CLI;
+  if (configured) return configured;
+  try {
+    const path = fileURLToPath(new URL("../bin/pi-global-usage.js", import.meta.url));
+    return existsSync(path) ? path : null;
+  } catch {
+    return null;
+  }
+}
+
+function createIngestScheduler(pi) {
+  const cliPath = usageCliPath();
+  let timer = null;
+  let queue = Promise.resolve();
+
+  function run(args) {
+    if (!cliPath) return Promise.resolve(null);
+    const task = queue
+      .catch(() => {})
+      .then(() => pi.exec(process.execPath, [cliPath, ...args], { timeout: 10_000 }));
+    queue = task.catch(() => {});
+    return task;
+  }
+
+  function request() {
+    if (!cliPath || timer) return;
+    timer = setTimeout(() => {
+      timer = null;
+      void run(["--ingest"]);
+    }, 100);
+  }
+
+  return { request };
+}
+
+function logRow(ctx, { usage, provider, model, source, entryId, responseId, eventTimestamp, onLogged }) {
   if (!usage) return;
   try {
     const input = num(usage.input);
@@ -53,11 +98,13 @@ function logRow(ctx, { usage, provider, model, source, entryId }) {
       cwd = ctx.cwd || ctx.sessionManager?.getCwd?.() || null;
     } catch {}
 
-    const ts = Date.now();
+    const ts = timestamp(eventTimestamp);
     const row = {
-      dedupe_key: entryId
-        ? `entry:${session_id}:${entryId}`
-        : `live:${session_id}:${ts}:${provider}:${model}:${input}:${output}:${cache_read}:${cache_write}`,
+      dedupe_key: responseId
+        ? `response:${session_id}:${responseId}`
+        : entryId
+          ? `entry:${session_id}:${entryId}`
+          : `live:${session_id}:${ts}:${provider}:${model}:${input}:${output}:${cache_read}:${cache_write}`,
       ts,
       session_id,
       session_name,
@@ -66,6 +113,7 @@ function logRow(ctx, { usage, provider, model, source, entryId }) {
       model: model || "unknown",
       source: source || "live",
       entry_id: entryId || null,
+      response_id: responseId || null,
       input,
       output,
       cache_read,
@@ -79,12 +127,19 @@ function logRow(ctx, { usage, provider, model, source, entryId }) {
       mkdirSync(dirname(path), { recursive: true });
     } catch {}
     appendFileSync(path, JSON.stringify(row) + "\n", { flush: true });
+    onLogged?.();
   } catch {
     // usage logging must never break the agent turn
   }
 }
 
 export default function (pi) {
+  const ingest = createIngestScheduler(pi);
+  pi.on("session_start", async () => {
+    // Replay rows left by an earlier process as soon as the session starts.
+    ingest.request();
+  });
+
   // Main hook: every assistant message carries final usage.
   pi.on("message_end", async (event, ctx) => {
     try {
@@ -95,6 +150,9 @@ export default function (pi) {
         provider: m.provider || ctx.model?.provider || "unknown",
         model: m.model || ctx.model?.id || "unknown",
         source: "live",
+        responseId: m.responseId,
+        eventTimestamp: m.timestamp,
+        onLogged: ingest.request,
       });
     } catch {}
   });
@@ -108,6 +166,9 @@ export default function (pi) {
         provider: "tool",
         model: event.toolName || "tool",
         source: "tool",
+        responseId: event.responseId,
+        eventTimestamp: event.timestamp,
+        onLogged: ingest.request,
       });
     } catch {}
   });
@@ -117,11 +178,18 @@ export default function (pi) {
     try {
       const usage = event?.compactionEntry?.usage;
       if (!usage) return;
-      logRow(ctx, { usage, provider: "pi", model: "compaction", source: "compact" });
+      logRow(ctx, {
+        usage,
+        provider: "pi",
+        model: "compaction",
+        source: "compact",
+        eventTimestamp: event.compactionEntry.timestamp,
+        onLogged: ingest.request,
+      });
     } catch {}
   });
 
-  // Convenience: /usage shows today's totals from the live log (no sqlite needed).
+  // Convenience: /usage shows today's totals from the live log.
   pi.registerCommand("usage", {
     description: "Show today's logged token/cost usage (pi-global-usage)",
     handler: async (_args, ctx) => {

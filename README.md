@@ -16,13 +16,14 @@ pi-global-usage/
 
 Data flow: the extension appends one JSON line per model response to
 `~/.pi/agent/usage.jsonl` (atomic append — safe for concurrent `pi`
-sessions; `node:sqlite` is not available in pi's extension sandbox, so the
-extension never touches sqlite). The CLI ingests that log into
-`~/.pi/agent/usage.db` on every run (WAL mode, idempotent via dedupe keys)
-and backfills history from `sessions/*.jsonl`. Logging is fire-and-forget
-and never throws into the agent turn.
+sessions). It schedules a separate `pi-global-usage --ingest` process, because
+extensions cannot rely on `node:sqlite`. The CLI ingests that log on startup
+(WAL mode, idempotent via dedupe keys) and can backfill history from
+`sessions/*.jsonl`. Logging is fire-and-forget and never throws into the agent
+turn.
 
-Overrides: `$PI_USAGE_LOG`, `$PI_USAGE_DB`, `$PI_CODING_AGENT_DIR`.
+Overrides: `$PI_USAGE_LOG`, `$PI_USAGE_DB`, `$PI_USAGE_CLI`,
+`$PI_CODING_AGENT_DIR`.
 
 ## Install
 
@@ -54,7 +55,7 @@ pi install git:github.com/<you>/pi-global-usage
 
 ```bash
 pi-global-usage [--by model|session] [--days N] [--sort cost|total|calls|input]
-                [--limit N] [--json] [--backfill] [--db PATH]
+                [--limit N] [--json] [--backfill] [--ingest] [--db PATH]
 ```
 
 Columns match the request: `Calls ┃ Input ┃ Output ┃ Cache R ┃ Cache W ┃ Total ┃ Cost`.
@@ -65,10 +66,12 @@ Examples:
 pi-global-usage --by model --days 7
 pi-global-usage --by session --days 30 --limit 10
 pi-global-usage --backfill --by model   # rescan sessions/*.jsonl into usage.db
+pi-global-usage --ingest                # merge usage.jsonl without rendering
 ```
 
 First run with no DB auto-backfills from `~/.pi/agent/sessions/`, so the
-first table is already populated. The extension then keeps it fresh on every
-assistant `message_end` (+ tool-nested usage + compaction usage).
+first table is already populated. The extension schedules ingestion after each
+assistant `message_end` (+ tool-nested usage + compaction usage), with the CLI
+available to replay any pending JSONL rows.
 
 In pi itself, `/usage` prints today's totals from the same DB.

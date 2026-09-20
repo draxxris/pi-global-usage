@@ -2,9 +2,9 @@
 // pi extension (loaded via jiti) and the CLI (plain node) can import it.
 // Zero dependencies: uses node:sqlite (Node >= 22.5).
 import { DatabaseSync } from "node:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export function configDir() {
   return (
@@ -78,6 +78,25 @@ export function truncateLiveLog(logPath = liveLogPath()) {
   } catch {
     return false;
   }
+}
+
+/** Claim the current live log before ingesting it. New rows are written to a
+ * fresh usage.jsonl, so a concurrent pi process cannot be truncated away. */
+export function drainLiveLog(db, logPath = liveLogPath()) {
+  const claimedPath = join(
+    dirname(logPath),
+    `.${basename(logPath)}.${process.pid}.${Date.now()}.pending`,
+  );
+  try {
+    renameSync(logPath, claimedPath);
+  } catch {
+    return 0;
+  }
+  const count = ingestLiveLog(db, claimedPath);
+  try {
+    unlinkSync(claimedPath);
+  } catch {}
+  return count;
 }
 
 export function openDb(path = dbPath()) {
@@ -166,8 +185,13 @@ export function liveDedupeKey({ session_id, ts, provider, model, input, output, 
   return `live:${session_id}:${ts}:${provider}:${model}:${input}:${output}:${cache_read}:${cache_write}`;
 }
 
+function usageDedupeKey({ session_id, response_id, ts, provider, model, input, output, cache_read, cache_write }) {
+  if (response_id) return `response:${session_id}:${response_id}`;
+  return liveDedupeKey({ session_id, ts, provider, model, input, output, cache_read, cache_write });
+}
+
 /** Normalize a pi Usage object + envelope into a row. Returns null if empty. */
-export function toRow({ usage, provider, model, session_id, session_name, cwd, ts, source, entry_id, dedupe_key }) {
+export function toRow({ usage, provider, model, session_id, session_name, cwd, ts, source, entry_id, response_id, dedupe_key }) {
   if (!usage) return null;
   const input = num(usage.input);
   const output = num(usage.output);
@@ -184,9 +208,17 @@ export function toRow({ usage, provider, model, session_id, session_name, cwd, t
   return {
     dedupe_key:
       dedupe_key ||
-      (entry_id
-        ? `entry:${session_id}:${entry_id}`
-        : liveDedupeKey({ session_id, ts: stamp, provider, model, input, output, cache_read, cache_write })),
+      usageDedupeKey({
+        session_id,
+        response_id,
+        ts: stamp,
+        provider,
+        model,
+        input,
+        output,
+        cache_read,
+        cache_write,
+      }),
     ts: stamp,
     session_id,
     session_name,
@@ -281,6 +313,7 @@ export function parseSessionFile(file) {
           ts: m.timestamp || ts,
           source: "backfill",
           entry_id: entry.id,
+          response_id: m.responseId,
         });
         if (row) {
           row.session_name = sessionName;
@@ -298,6 +331,7 @@ export function parseSessionFile(file) {
           ts: m.timestamp || ts,
           source: "backfill-tool",
           entry_id: entry.id,
+          response_id: m.responseId,
         });
         if (row) {
           row.session_name = sessionName;
@@ -339,10 +373,14 @@ export function backfill(db, dir = sessionsDir(), onProgress) {
        source, entry_id, input, output, cache_read, cache_write, reasoning, total, cost)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
+  const legacyStmt = db.prepare("SELECT 1 FROM usage_events WHERE dedupe_key = ? LIMIT 1");
   for (const f of files) {
     const parsed = parseSessionFile(f);
     for (const r of parsed) {
       try {
+        // Older backfills used entry:<session>:<entry> keys. Avoid creating
+        // a second row when reprocessing those sessions with canonical keys.
+        if (r.entry_id && legacyStmt.get(`entry:${r.session_id}:${r.entry_id}`)) continue;
         stmt.run(
           r.dedupe_key, r.ts, new Date(r.ts).toISOString().slice(0, 10),
           r.session_id, r.session_name || null, r.cwd || null,
